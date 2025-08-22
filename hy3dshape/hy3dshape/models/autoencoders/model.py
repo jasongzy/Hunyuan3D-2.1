@@ -331,6 +331,8 @@ class ShapeVAE(VectsetVAE):
         if sample_posterior:
             latents = posterior.sample()
         else:
+            # latents = posterior.mode()
+            latents = posterior
         return latents, fps_idx
 
     def decode(self, latents):
