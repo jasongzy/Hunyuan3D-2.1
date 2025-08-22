@@ -163,7 +163,7 @@ class VectsetVAE(nn.Module):
         variant='fp16',
         subfolder='hunyuan3d-vae-v2-1',
         **kwargs,
-    ):
+    ) -> "ShapeVAE":
         config_path, ckpt_path = smart_load_model(
             model_path,
             subfolder=subfolder,

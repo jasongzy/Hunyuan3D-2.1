@@ -315,8 +315,11 @@ class FlashVDMVolumeDecoding:
             octree_resolution = octree_resolution // 2
         resolutions.reverse()
         resolutions[0] = round(resolutions[0] / mini_grid_num) * mini_grid_num - 1
-        for i, resolution in enumerate(resolutions[1:]):
-            resolutions[i + 1] = resolutions[0] * 2 ** (i + 1)
+        # for i, resolution in enumerate(resolutions[1:]):
+        #     resolutions[i + 1] = resolutions[0] * 2 ** (i + 1)
+        base_res_plus_1 = resolutions[0] + 1
+        for i in range(1, len(resolutions)):
+            resolutions[i] = base_res_plus_1 * (2 ** i) - 1
 
         logger.info(f"FlashVDMVolumeDecoding Resolution: {resolutions}")
 
