@@ -518,6 +518,90 @@ def fps(
     return output
 
 
+def indices_flatten(idx: torch.Tensor, N: int) -> torch.Tensor:
+    """
+    Prepares indices for indexing a flattened tensor.
+
+    This function converts a batch of indices `idx` (shape B, K) into a 1D
+    tensor `idx_flatten`, suitable for selecting elements from a flattened
+    tensor like `pts.reshape(B*N, 3)[idx_flatten]`.
+
+    Args:
+        idx: (B, K)
+        N: The size of the `pts` tensor in its 1st dimension, i.e., the number of points per batch.
+
+    Returns:
+        idx_flatten: (B*K,)
+    """
+    B, K = idx.shape
+    # For the b-th batch, all indices need an offset of b * N.
+    # torch.arange(B) -> [0, 1, 2, ..., B-1]
+    # offset -> [0, N, 2*N, ..., (B-1)*N]
+    offset = torch.arange(B, device=idx.device) * N
+    idx_with_offset = idx + offset.unsqueeze(1)
+    idx_flatten = idx_with_offset.reshape(-1)
+    return idx_flatten
+
+
+def indices_unflatten(idx_flatten: torch.Tensor, N: int, B: int) -> torch.Tensor:
+    """
+    Converts flattened indices back to a 2D tensor of indices.
+
+    This function takes a 1D tensor of indices `idx_flatten` and converts it
+    back to a 2D tensor of indices suitable for indexing a tensor with shape
+    (B, N, 3) using `torch.gather`.
+
+    Args:
+        idx_flatten: (B*K,)
+        N: The size of the `pts` tensor in its 1st dimension, i.e., the number of points per batch.
+        B: The original batch size.
+
+    Returns:
+        idx: (B, K)
+    """
+    idx = idx_flatten % N
+    idx = idx.reshape(B, -1)
+    return idx
+
+
+def combine_query_indices(
+    idx_query_random: torch.Tensor,
+    idx_query_sharpedge: torch.Tensor,
+    B: int,
+    input_random_pc_size: int,
+    input_sharpedge_pc_size: int
+) -> torch.Tensor:
+    idx_random_batched = indices_unflatten(idx_query_random, N=input_random_pc_size, B=B)
+    idx_sharpedge_batched = indices_unflatten(idx_query_sharpedge, N=input_sharpedge_pc_size, B=B)
+
+    idx_sharpedge_batched_offset = idx_sharpedge_batched + input_random_pc_size
+
+    idx_combined_batched = torch.cat([idx_random_batched, idx_sharpedge_batched_offset], dim=1)
+
+    idx_query = indices_flatten(idx_combined_batched, N=input_random_pc_size + input_sharpedge_pc_size)
+    return idx_query
+
+
+def split_query_indices(
+    idx_query: torch.Tensor,
+    B: int,
+    input_random_pc_size: int,
+    input_sharpedge_pc_size: int,
+    num_random_query: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    N_total = input_random_pc_size + input_sharpedge_pc_size
+    idx_query_batched = indices_unflatten(idx_query, N=N_total, B=B)
+
+    idx_random_batched = idx_query_batched[:, :num_random_query]
+    idx_sharpedge_batched_offset = idx_query_batched[:, num_random_query:]
+
+    idx_sharpedge_batched = idx_sharpedge_batched_offset - input_random_pc_size
+
+    recovered_idx_query_random = indices_flatten(idx_random_batched, N=input_random_pc_size)
+    recovered_idx_query_sharpedge = indices_flatten(idx_sharpedge_batched, N=input_sharpedge_pc_size)
+    return recovered_idx_query_random, recovered_idx_query_sharpedge
+
+
 class PointCrossAttentionEncoder(nn.Module):
 
     def __init__(
@@ -582,7 +666,7 @@ class PointCrossAttentionEncoder(nn.Module):
         else:
             self.ln_post = None
 
-    def sample_points_and_latents(self, pc: torch.FloatTensor, feats: Optional[torch.FloatTensor] = None):
+    def sample_points_and_latents(self, pc: torch.FloatTensor, feats: Optional[torch.FloatTensor] = None, fps_idx=None):
         B, N, D = pc.shape
         num_pts = self.num_latents * self.downsample_ratio
 
@@ -590,7 +674,7 @@ class PointCrossAttentionEncoder(nn.Module):
         num_latents = int(num_pts / self.downsample_ratio)
 
         # Compute the number of random and sharpedge latents
-        num_random_query = self.pc_size / (self.pc_size + self.pc_sharpedge_size) * num_latents
+        num_random_query = int(self.pc_size / (self.pc_size + self.pc_sharpedge_size) * num_latents)
         num_sharpedge_query = num_latents - num_random_query
 
         # Split random and sharpedge surface points
@@ -602,35 +686,51 @@ class PointCrossAttentionEncoder(nn.Module):
         # Randomly select random surface points and random query points
         input_random_pc_size = int(num_random_query * self.downsample_ratio)
         random_query_ratio = num_random_query / input_random_pc_size
-        idx_random_pc = torch.randperm(random_pc.shape[1], device=random_pc.device)[:input_random_pc_size]
-        input_random_pc = random_pc[:, idx_random_pc, :]
-        flatten_input_random_pc = input_random_pc.view(B * input_random_pc_size, D)
-        N_down = int(flatten_input_random_pc.shape[0] / B)
-        batch_down = torch.arange(B).to(pc.device)
-        batch_down = torch.repeat_interleave(batch_down, N_down)
-        idx_query_random = fps(flatten_input_random_pc, batch_down, ratio=random_query_ratio)
+        input_sharpedge_pc_size = int(num_sharpedge_query * self.downsample_ratio)
+        # idx_random_pc = torch.randperm(random_pc.shape[1], device=random_pc.device)[:input_random_pc_size]
+        # input_random_pc = random_pc[:, idx_random_pc, :]
+        input_random_pc = random_pc
+        flatten_input_random_pc = input_random_pc.reshape(B * input_random_pc_size, D)
+        if fps_idx is None:
+            N_down = int(flatten_input_random_pc.shape[0] / B)
+            batch_down = torch.arange(B).to(pc.device)
+            batch_down = torch.repeat_interleave(batch_down, N_down)
+            idx_query_random = fps(flatten_input_random_pc, batch_down, ratio=random_query_ratio)
+        else:
+            if num_sharpedge_query == 0:
+                idx_query_random = fps_idx
+            else:
+                idx_query_random, idx_query_sharpedge = split_query_indices(fps_idx, B, input_random_pc_size, input_sharpedge_pc_size, num_random_query)
         query_random_pc = flatten_input_random_pc[idx_query_random].view(B, -1, D)
 
         # Randomly select sharpedge surface points and sharpedge query points
-        input_sharpedge_pc_size = int(num_sharpedge_query * self.downsample_ratio)
         if input_sharpedge_pc_size == 0:
             input_sharpedge_pc = torch.zeros(B, 0, D, dtype=input_random_pc.dtype).to(pc.device)
             query_sharpedge_pc = torch.zeros(B, 0, D, dtype=query_random_pc.dtype).to(pc.device)
+            idx_query_sharpedge = torch.zeros(0, dtype=torch.long).to(pc.device)
         else:
             sharpedge_query_ratio = num_sharpedge_query / input_sharpedge_pc_size
-            idx_sharpedge_pc = torch.randperm(sharpedge_pc.shape[1], device=sharpedge_pc.device)[
-                               :input_sharpedge_pc_size]
-            input_sharpedge_pc = sharpedge_pc[:, idx_sharpedge_pc, :]
-            flatten_input_sharpedge_surface_points = input_sharpedge_pc.view(B * input_sharpedge_pc_size, D)
-            N_down = int(flatten_input_sharpedge_surface_points.shape[0] / B)
-            batch_down = torch.arange(B).to(pc.device)
-            batch_down = torch.repeat_interleave(batch_down, N_down)
-            idx_query_sharpedge = fps(flatten_input_sharpedge_surface_points, batch_down, ratio=sharpedge_query_ratio)
+            # idx_sharpedge_pc = torch.randperm(sharpedge_pc.shape[1], device=sharpedge_pc.device)[
+            #                    :input_sharpedge_pc_size]
+            # input_sharpedge_pc = sharpedge_pc[:, idx_sharpedge_pc, :]
+            input_sharpedge_pc = sharpedge_pc
+            flatten_input_sharpedge_surface_points = input_sharpedge_pc.reshape(B * input_sharpedge_pc_size, D)
+            if fps_idx is None:
+                N_down = int(flatten_input_sharpedge_surface_points.shape[0] / B)
+                batch_down = torch.arange(B).to(pc.device)
+                batch_down = torch.repeat_interleave(batch_down, N_down)
+                idx_query_sharpedge = fps(flatten_input_sharpedge_surface_points, batch_down, ratio=sharpedge_query_ratio)
             query_sharpedge_pc = flatten_input_sharpedge_surface_points[idx_query_sharpedge].view(B, -1, D)
 
         # Concatenate random and sharpedge surface points and query points
         query_pc = torch.cat([query_random_pc, query_sharpedge_pc], dim=1)
         input_pc = torch.cat([input_random_pc, input_sharpedge_pc], dim=1)
+
+        if num_sharpedge_query == 0:
+            idx_query = idx_query_random
+        else:
+            idx_query = combine_query_indices(idx_query_random, idx_query_sharpedge, B, input_random_pc_size, input_sharpedge_pc_size)
+            # assert (input_pc.reshape(-1, 3)[idx_query] == query_pc.reshape(-1, 3)).all()
 
         # PE
         query = self.fourier_embedder(query_pc)
@@ -641,8 +741,9 @@ class PointCrossAttentionEncoder(nn.Module):
 
             random_surface_feats, sharpedge_surface_feats = torch.split(feats, [self.pc_size, self.pc_sharpedge_size],
                                                                         dim=1)
-            input_random_surface_feats = random_surface_feats[:, idx_random_pc, :]
-            flatten_input_random_surface_feats = input_random_surface_feats.view(B * input_random_pc_size, -1)
+            # input_random_surface_feats = random_surface_feats[:, idx_random_pc, :]
+            input_random_surface_feats = random_surface_feats
+            flatten_input_random_surface_feats = input_random_surface_feats.reshape(B * input_random_pc_size, -1)
             query_random_feats = flatten_input_random_surface_feats[idx_query_random].view(B, -1,
                                                                                            flatten_input_random_surface_feats.shape[
                                                                                                -1])
@@ -653,8 +754,9 @@ class PointCrossAttentionEncoder(nn.Module):
                 query_sharpedge_feats = torch.zeros(B, 0, self.point_feats, dtype=query_random_feats.dtype).to(
                     pc.device)
             else:
-                input_sharpedge_surface_feats = sharpedge_surface_feats[:, idx_sharpedge_pc, :]
-                flatten_input_sharpedge_surface_feats = input_sharpedge_surface_feats.view(B * input_sharpedge_pc_size,
+                # input_sharpedge_surface_feats = sharpedge_surface_feats[:, idx_sharpedge_pc, :]
+                input_sharpedge_surface_feats = sharpedge_surface_feats
+                flatten_input_sharpedge_surface_feats = input_sharpedge_surface_feats.reshape(B * input_sharpedge_pc_size,
                                                                                            -1)
                 query_sharpedge_feats = flatten_input_sharpedge_surface_feats[idx_query_sharpedge].view(B, -1,
                                                                                                         flatten_input_sharpedge_surface_feats.shape[
@@ -686,9 +788,9 @@ class PointCrossAttentionEncoder(nn.Module):
         return query.view(B, -1, query.shape[-1]), data.view(B, -1, data.shape[-1]), [query_pc, input_pc,
                                                                                       query_random_pc, input_random_pc,
                                                                                       query_sharpedge_pc,
-                                                                                      input_sharpedge_pc]
+                                                                                      input_sharpedge_pc, idx_query]
 
-    def forward(self, pc, feats):
+    def forward(self, pc, feats, fps_idx=None):
         """
 
         Args:
@@ -699,7 +801,7 @@ class PointCrossAttentionEncoder(nn.Module):
 
         """
 
-        query, data, pc_infos = self.sample_points_and_latents(pc, feats)
+        query, data, pc_infos = self.sample_points_and_latents(pc, feats, fps_idx)
 
         query = self.input_proj(query)
         query = query

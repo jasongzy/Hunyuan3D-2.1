@@ -321,17 +321,17 @@ class ShapeVAE(VectsetVAE):
         latents = self.transformer(latents)
         return latents
 
-    def encode(self, surface, sample_posterior=True):
+    def encode(self, surface, fps_idx=None, sample_posterior=True):
         pc, feats = surface[:, :, :3], surface[:, :, 3:]
-        latents, _ = self.encoder(pc, feats)
+        latents, pc_infos = self.encoder(pc, feats, fps_idx)
+        fps_idx = pc_infos[-1]
         # print(latents.shape, self.pre_kl.weight.shape)
         moments = self.pre_kl(latents)
         posterior = DiagonalGaussianDistribution(moments, feat_dim=-1)
         if sample_posterior:
             latents = posterior.sample()
         else:
-            latents = posterior.mode()
-        return latents
+        return latents, fps_idx
 
     def decode(self, latents):
         latents = self.post_kl(latents)
